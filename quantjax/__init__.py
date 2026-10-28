@@ -25,5 +25,6 @@ from quantjax import (american_option, asian_option, bermudan_option,
                       heston, hull_white, letsberational, lmm, malliavin,
                       option_utils, reduced_form_model, rng, sabr,
                       scenario_analysis, stochastic_model, stress_testing,
-                      structural_model, valuation_adjustment, var, vasicek,
+                      structural_model, valuation_adjustment,
+                      vanilla_analytics, var, vasicek,
                       yield_curve_construction)
