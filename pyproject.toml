@@ -1,0 +1,17 @@
+[project]
+name = "quantjax"
+version = "0.1.0"
+description = "JAX port of torchquantlib pricing models, mirroring quantburn/quantcandle"
+requires-python = ">=3.10"
+dependencies = ["jax", "jaxlib", "numpy", "pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["quantjax*"]
+
+[tool.pytest.ini_options]
+# Test functions live inside the ported modules themselves (quantburn style).
+python_files = ["quantjax/*.py"]
