@@ -1,6 +1,21 @@
 """Port of quantburn/src/greeks.rs (originally greeks/greeks.py,
 ``MalliavinGreeks``, re-exported by greeks/malliavin.py as ``Greeks``).
-Monte-Carlo option greeks via Malliavin-calculus weights.
+Monte-Carlo option greeks via likelihood-ratio (integration-by-parts) /
+pathwise weights.
+
+Estimator-correctness note (2026-10-29): ``european_option_greeks`` and
+``digital_option_greeks`` were re-derived with proper LR / pathwise weights
+and verified against QuantLib 1.44 ``AnalyticEuropeanEngine`` greeks at 500k
+paths over three parameter sets (relative errors: delta <= 1.4e-3,
+gamma <= 1.0e-2, vega <= 1.5e-2, theta <= 2.8e-3, rho <= 2.9e-3; digital
+kernel bias at epsilon = 2.0 by exact quadrature: delta -0.50%, gamma -0.65%,
+vega +0.63%). The previous implementation multiplied the payoff by pathwise
+derivatives of S_T (e.g. ``S_T*Z/sqrt(T)``) where LR weights are required,
+biasing every European greek by 26x-386x (see cross-check
+results/risk_golden.json). ``barrier_option_greeks``,
+``lookback_option_delta``, ``basket_option_greeks`` and
+``asian_option_greeks`` still use the OLD weight construction and are
+BIASED / UNDER REVIEW (same extra-S_T-factor defect; left unchanged).
 
 Stochasticity: all standard normals come from quantjax.rng.Xorshift64Star
 (Box-Muller, bit-exact against quantburn's scripts/refgen.py). Draw order
@@ -8,9 +23,10 @@ replicates the row-major fill of the torch tensors: for an
 (num_paths, num_steps) draw, path-major then step-minor. Tests use seed 3001.
 
 Math is done in plain Python floats (float64). Expected values come from the
-float64 reference generator scripts/gen_greeks.py (same normals, same seed);
-tolerance 1e-6 relative (1e-4 for the digital greeks, where the 1e-4-wide
-Gaussian Dirac approximation makes the estimators large and ill-conditioned).
+float64 reference generator quantburn/scripts/gen_greeks.py (same normals,
+same seed); tolerance 1e-6 relative (1e-4 for the digital greeks, where the
+Gaussian-kernel Dirac approximation makes the estimators large and
+ill-conditioned).
 """
 
 import math
@@ -64,39 +80,48 @@ def european_option_greeks(
     num_paths: int,
     seed: int,
 ) -> EuropeanGreeks:
-    """Malliavin greeks for a European call (single-step GBM, exact terminal
-    simulation)."""
+    """Greeks for a European call under GBM (single-step exact terminal
+    simulation, S_T = S0*exp((r - sigma^2/2)T + sigma*sqrt(T)*Z), q = 0).
+
+    Estimators (QuantLib-verified, see module doc):
+      delta (likelihood-ratio): disc * E[payoff * Z] / (sigma*S0*sqrt(T))
+      gamma (2nd-order LR):     disc * [E[payoff*(Z^2-1)]
+                                        - sigma*sqrt(T)*E[payoff*Z]]
+                                / (sigma^2 * T * S0^2)
+      vega (pathwise):          disc * E[1{S_T>K} * S_T * (sqrt(T)*Z - sigma*T)]
+      theta (BS PDE identity):  r*price - r*S0*delta - sigma^2*S0^2*gamma/2
+      rho   (identity, q=0):    T * (S0*delta - price)
+    """
     rng = Xorshift64Star(seed)
-    dt = t
-    sqrt_dt = math.sqrt(dt)
+    sqrt_t = math.sqrt(t)
     drift = (r - 0.5 * sigma * sigma) * t
     discount = math.exp(-r * t)
 
-    # payoff*Dt, payoff*D2, payoff*Dsigma, payoff*S, payoff*Dr, payoff
-    acc = [0.0] * 6
+    # LR / pathwise accumulators (the old S_T-scaled derivatives of S_T
+    # biased every greek by 26x-386x -- see module doc).
+    s_pz = s_pz2 = s_vega = s_p = 0.0
     for _ in range(num_paths):
         z = rng.next_std_normal()
-        st = s0 * math.exp(drift + sigma * sqrt_dt * z)
+        st = s0 * math.exp(drift + sigma * sqrt_t * z)
         payoff = max(st - k, 0.0)
-        dt_st = st * z / sqrt_dt
-        d2t_st = dt_st * (z / sqrt_dt - sigma * sqrt_dt)
-        d_sigma_st = st * (z * sqrt_dt - sigma * dt)
-        d_r_st = st * t
-        acc[0] += payoff * dt_st
-        acc[1] += payoff * d2t_st
-        acc[2] += payoff * d_sigma_st
-        acc[3] += payoff * st
-        acc[4] += payoff * d_r_st
-        acc[5] += payoff
+        s_pz += payoff * z
+        s_pz2 += payoff * (z * z - 1.0)
+        if st > k:
+            s_vega += st * (sqrt_t * z - sigma * t)
+        s_p += payoff
     n = float(num_paths)
+    price = discount * s_p / n
+    delta = discount * (s_pz / n) / (sigma * s0 * sqrt_t)
+    gamma = discount * (s_pz2 / n - sigma * sqrt_t * s_pz / n) / (sigma**2 * t * s0**2)
+    vega = discount * s_vega / n
+    theta = r * price - r * s0 * delta - 0.5 * sigma**2 * s0**2 * gamma
+    rho = t * (s0 * delta - price)
     return EuropeanGreeks(
-        delta=discount * (acc[0] / n) / (sigma * s0),
-        gamma=discount * (acc[1] / n) / (sigma * sigma * s0 * s0),
-        vega=discount * (acc[2] / n) / sigma,
-        theta=-discount
-        * ((r - 0.5 * sigma * sigma) * acc[3] / n + 0.5 * sigma * acc[0] / n)
-        / t,
-        rho=discount * (acc[4] / n) - t * discount * (acc[5] / n),
+        delta=delta,
+        gamma=gamma,
+        vega=vega,
+        theta=theta,
+        rho=rho,
     )
 
 
@@ -111,34 +136,41 @@ def digital_option_greeks(
     epsilon: float,
     seed: int,
 ) -> Greeks3:
-    """Malliavin greeks for a digital (cash-or-nothing) call, with the Dirac
-    delta approximated by a narrow Gaussian of width ``epsilon``."""
+    """Greeks for a digital (cash-or-nothing) call under GBM, with the Dirac
+    delta approximated by a Gaussian kernel of width ``epsilon``
+    (K_eps(x) = phi(x)/epsilon, x = (S_T-K)/epsilon, smoothed payoff
+    h(S_T) = Q*Phi((S_T-K)/epsilon)).
+
+    Pathwise-kernel estimators (QuantLib-verified, see module doc; residual
+    kernel bias at epsilon = 2.0: delta -0.50%, gamma -0.65%, vega +0.63%):
+      delta: disc * Q * E[K_eps * S_T / S0]
+      gamma: disc * Q * E[dK_eps/ds * (S_T/S0)^2],
+             dK_eps/ds = -(x/epsilon) * K_eps  (h''(s)/Q; note the tempting
+             -(x/epsilon^2) form carries a spurious extra 1/epsilon)
+      vega:  disc * Q * E[K_eps * S_T * (sqrt(T)*Z - sigma*T)]
+    """
     rng = Xorshift64Star(seed)
-    dt = t
-    sqrt_dt = math.sqrt(dt)
+    sqrt_t = math.sqrt(t)
     drift = (r - 0.5 * sigma * sigma) * t
     discount = math.exp(-r * t)
     normalizer = epsilon * math.sqrt(2.0 * math.pi)
 
-    acc = [0.0] * 3
+    sd = sg = sv = 0.0
     for _ in range(num_paths):
         z = rng.next_std_normal()
-        st = s0 * math.exp(drift + sigma * sqrt_dt * z)
-        delta_approx = (1.0 / normalizer) * math.exp(
-            -0.5 * ((st - k) / epsilon) ** 2
-        )
-        dt_st = st * z / sqrt_dt
-        d2t_st = dt_st * (z / sqrt_dt - sigma * sqrt_dt)
-        d_sigma_st = st * (z * sqrt_dt - sigma * dt)
-        w = q * delta_approx
-        acc[0] += w * dt_st
-        acc[1] += w * d2t_st
-        acc[2] += w * d_sigma_st
+        st = s0 * math.exp(drift + sigma * sqrt_t * z)
+        x = (st - k) / epsilon
+        k_eps = (1.0 / normalizer) * math.exp(-0.5 * x * x)
+        k_eps_s = -(x / epsilon) * k_eps  # dK_eps/ds, see doc
+        u = st / s0
+        sd += k_eps * u
+        sg += k_eps_s * u * u
+        sv += k_eps * st * (sqrt_t * z - sigma * t)
     n = float(num_paths)
     return Greeks3(
-        delta=discount * (acc[0] / n) / (sigma * s0),
-        gamma=discount * (acc[1] / n) / (sigma * sigma * s0 * s0),
-        vega=discount * (acc[2] / n) / sigma,
+        delta=discount * q * sd / n,
+        gamma=discount * q * sg / n,
+        vega=discount * q * sv / n,
     )
 
 
@@ -179,7 +211,16 @@ def barrier_option_greeks(
     seed: int,
 ) -> Greeks3:
     """Malliavin greeks for a knock-out barrier call (``up-and-out`` or
-    ``down-and-out``), monitored at each simulation step."""
+    ``down-and-out``), monitored at each simulation step.
+
+    .. warning::
+        BIASED / UNDER REVIEW (2026-10-29): this estimator still uses the
+        old weight construction (payoff * S_T-scaled pathwise derivatives of
+        S_T where likelihood-ratio weights are required), the same defect
+        that biased ``european_option_greeks`` by 26x-386x. Values are NOT
+        trustworthy; left unchanged pending a QuantLib-verified
+        re-derivation.
+    """
     if option_type != "up-and-out" and option_type != "down-and-out":
         raise ValueError("Invalid option_type. Use 'up-and-out' or 'down-and-out'.")
     up = option_type == "up-and-out"
@@ -225,7 +266,13 @@ def lookback_option_delta(
     num_steps: int,
     seed: int,
 ) -> float:
-    """Malliavin delta for a floating-strike lookback call."""
+    """Malliavin delta for a floating-strike lookback call.
+
+    .. warning::
+        BIASED / UNDER REVIEW (2026-10-29): old weight construction (see the
+        module docstring); left unchanged pending a QuantLib-verified
+        re-derivation.
+    """
     rng = Xorshift64Star(seed)
     dt = t / num_steps
     sqrt_dt = math.sqrt(dt)
@@ -269,7 +316,13 @@ def basket_option_greeks(
     seed: int,
 ) -> Tuple[List[float], List[float], List[float]]:
     """Malliavin greeks for a European basket (arithmetic-weighted) call on
-    correlated GBM assets; returns (Delta, Gamma, Vega), one entry per asset."""
+    correlated GBM assets; returns (Delta, Gamma, Vega), one entry per asset.
+
+    .. warning::
+        BIASED / UNDER REVIEW (2026-10-29): old weight construction (see the
+        module docstring); left unchanged pending an independent
+        (e.g. common-random-number finite-difference) verification.
+    """
     num_assets = len(s0)
     l = cholesky(rho)
     rng = Xorshift64Star(seed)
@@ -322,7 +375,13 @@ def asian_option_greeks(
     num_steps: int,
     seed: int,
 ) -> Greeks3:
-    """Malliavin greeks for an arithmetic-average Asian call."""
+    """Malliavin greeks for an arithmetic-average Asian call.
+
+    .. warning::
+        BIASED / UNDER REVIEW (2026-10-29): old weight construction (see the
+        module docstring); left unchanged pending an independent
+        verification.
+    """
     rng = Xorshift64Star(seed)
     dt = t / num_steps
     sqrt_dt = math.sqrt(dt)
@@ -375,20 +434,25 @@ def _close(a: float, b: float, tol: float) -> bool:
 
 def test_european_matches_reference():
     g = european_option_greeks(100.0, 100.0, 1.0, 0.05, 0.2, 20_000, _SEED)
-    assert _close(g.delta, 93.97332927208662, _TOL), f"delta {g.delta}"
-    assert _close(g.gamma, 7.268677237984516, _TOL), f"gamma {g.gamma}"
-    assert _close(g.vega, 7991.189624942042, _TOL), f"vega {g.vega}"
-    assert _close(g.theta, -230.13095761217176, _TOL), f"theta {g.theta}"
-    assert _close(g.rho, 1395.5863679889742, _TOL), f"rho {g.rho}"
+    # gen_greeks.py: european (2026-10-29 LR/pathwise weights; old literals
+    # encoded the biased S_T-derivative estimator, e.g. delta 93.97 vs the
+    # correct ~0.65)
+    assert _close(g.delta, 0.6499984107108641, _TOL), f"delta {g.delta}"
+    assert _close(g.gamma, 0.02041962761268718, _TOL), f"gamma {g.gamma}"
+    assert _close(g.vega, 38.012287272987834, _TOL), f"vega {g.vega}"
+    assert _close(g.theta, -6.8060708622095625, _TOL), f"theta {g.theta}"
+    assert _close(g.rho, 54.44290679344252, _TOL), f"rho {g.rho}"
 
 
 def test_digital_matches_reference():
-    # epsilon=2.0; the Python default epsilon=1e-4 makes every estimator
-    # numerically zero (documented quirk in quantburn's greeks.rs).
+    # epsilon=2.0, corrected 2026-10-29 pathwise-kernel weights (residual
+    # kernel bias at eps=2.0: delta -0.50%, gamma -0.65%, vega +0.63%); the
+    # Python default epsilon=1e-4 makes every estimator numerically zero
+    # (documented quirk in quantburn's greeks.rs).
     g = digital_option_greeks(100.0, 100.0, 1.0, 0.05, 0.2, 10.0, 20_000, 2.0, _SEED)
-    assert _close(g.delta, -0.14213961143402573, 1e-6), f"delta {g.delta}"
-    assert _close(g.gamma, 0.0029487745130569966, 1e-6), f"gamma {g.gamma}"
-    assert _close(g.vega, -33.29994785023318, 1e-6), f"vega {g.vega}"
+    assert _close(g.delta, 0.19085986706830554, 1e-6), f"delta {g.delta}"
+    assert _close(g.gamma, -0.003820124062759267, 1e-6), f"gamma {g.gamma}"
+    assert _close(g.vega, -6.659989570046656, 1e-6), f"vega {g.vega}"
 
 
 def test_barrier_matches_reference():

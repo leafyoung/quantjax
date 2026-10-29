@@ -17,10 +17,23 @@ formulas branch-for-branch, including the rebate terms and the
 AnalyticEuropeanEngine) and against tff itself in float64; embedded literals
 below come from those runs.
 
-Rebate convention (tff semantics): for knock-outs the rebate is paid at hit,
-for knock-ins at expiry. QuantLib's AnalyticBarrierEngine agrees with tff on
-knock-in rebates but pays knock-out rebates at expiry, so knock-out-rebate
-literals are tff-float64-verified rather than QL-verified.
+Rebate conventions: by default (`rebate_paid_at_expiry=False`, tff
+semantics) a knock-out rebate is paid at hit and a knock-in rebate at
+expiry. With `rebate_paid_at_expiry=True` a knock-out rebate is instead
+paid at expiry iff the barrier is never touched (the standard
+Reiner-Rubinstein knock-out-rebate-at-expiry term `R * DF * P(survival)`,
+obtained by re-weighting the same survival-probability terms the knock-in
+rows use); knock-in results never depend on the flag.
+
+QuantLib cross-check (AnalyticBarrierEngine, QL 1.44): QL's knock-in rebate
+equals the survival term above to <=2e-15, and QL's knock-out rebate is paid
+at hit with the Haug `lam = sqrt(mu^2 + 2r/sigma^2)` parameterization
+(matches QL to <=2e-15), which differs from tff's `b`-parameterized
+hit-time term (e.g. by +0.0298 on the S=100 K=100 B=85 R=3 vol=25% T=1
+case). QL knock-out totals therefore match neither path; the
+`rebate_paid_at_expiry` knock-out test literals are composed from pure QL
+numbers, `QL KO(R=0) + QL KI rebate term`, which equals main + survival
+term exactly (engine agreement <=5.3e-15).
 """
 
 import math
@@ -66,6 +79,7 @@ def barrier_price_analytic(
     is_barrier_down: bool,
     is_knock_out: bool,
     is_call: bool,
+    rebate_paid_at_expiry: bool = False,
 ) -> float:
     """Price a continuously-monitored single-barrier option in closed form
     (Black-Scholes, tff ``barrier_price`` semantics).
@@ -76,6 +90,10 @@ def barrier_price_analytic(
     above ``spot``), matching the formula's domain. ``rebate`` is the fixed
     cash payout if a knock-out barrier is breached (paid at hit) or if a
     knock-in barrier is never breached (paid at expiry).
+    ``rebate_paid_at_expiry`` only affects knock-outs: with ``True`` the
+    rebate is paid at expiry iff the barrier is never touched instead of at
+    hit; knock-in rebates are paid at expiry in both conventions, so knock-in
+    results are identical under the flag.
     """
     index = (
         ((1 if is_barrier_down else 0) << 2)
@@ -83,6 +101,11 @@ def barrier_price_analytic(
         + (1 if is_call else 0)
     )
     masks = _MASK_GREATER_STRIKE[index] if strike > barrier else _MASK_LOWER_STRIKE[index]
+    if is_knock_out and rebate_paid_at_expiry:
+        # Knock-out with the rebate paid at expiry: move the rebate weight
+        # from the hit-time terms (columns 11-12) onto the survival
+        # probability terms (columns 9-10) that the knock-in rows use.
+        masks = masks[:8] + (masks[10], masks[11], 0, 0)
 
     call_or_put = 1.0 if is_call else -1.0
     below_or_above = 1.0 if is_barrier_down else -1.0
@@ -231,6 +254,54 @@ def test_barrier_with_rebate():
     # down-in call, rebate 1.5 paid at expiry if never knocked in
     v = barrier_price_analytic(0.25, 100.0, 1.0, 100.0, 85.0, 1.5, _R, _Q, True, False, True)
     assert abs(v - 1.8890581732854028) < 1e-11
+
+
+def test_barrier_ko_rebate_paid_at_expiry():
+    # Knock-out rebate paid at expiry iff the barrier is never touched:
+    # R * DF * P(survival) (standard Reiner-Rubinstein KO-rebate-at-expiry
+    # terms). QL's AnalyticBarrierEngine pays KO rebates at hit (Haug lam
+    # parameterization), so these literals are composed from pure QL numbers:
+    # QL KO(R=0) + QL KI rebate term (== the survival term); the engine
+    # reproduces them to <= 5.3e-15.
+    # known case: down-out call S=100 K=100 B=85 R=3 vol=25% T=1, r=5% q=2%
+    v = barrier_price_analytic(0.25, 100.0, 1.0, 100.0, 85.0, 3.0, _R, _Q,
+                               True, True, True, rebate_paid_at_expiry=True)
+    assert abs(v - 11.300833094739227) < 1e-10
+    # second QL grid point: up-out put S=100 K=90 B=112 R=4 vol=25% T=0.6,
+    # r=3% q=1%
+    v = barrier_price_analytic(0.25, 90.0, 0.6, 100.0, 112.0, 4.0, 0.03, 0.01,
+                               False, True, False, rebate_paid_at_expiry=True)
+    assert abs(v - 4.509289715741195) < 1e-10
+
+
+def test_barrier_rebate_flag_ki_invariance():
+    # Knock-in rebates are paid at expiry in both conventions, so knock-in
+    # results are bit-identical under the flag (all eight KI mask rows:
+    # up/down in, call/put, K > B and K <= B).
+    cases = [
+        (0.25, 130.0, 1.0, 100.0, 125.0, 2.0, _R, _Q, False, False, False),   # up-in put, K > B
+        (0.25, 140.0, 1.0, 100.0, 120.0, 1.0, _R, _Q, False, False, True),    # up-in call, K > B
+        (0.22, 95.0, 0.8, 100.0, 88.0, 2.0, 0.06, 0.01, True, False, False),  # down-in put, K > B
+        (0.25, 110.0, 1.0, 100.0, 85.0, 1.5, _R, _Q, True, False, True),      # down-in call, K > B
+        (0.25, 90.0, 0.6, 100.0, 112.0, 4.0, 0.03, 0.01, False, False, False),  # up-in put, K < B
+        (0.25, 100.0, 0.6, 100.0, 112.0, 4.0, 0.03, 0.01, False, False, True),  # up-in call, K < B
+        (0.22, 80.0, 0.8, 100.0, 88.0, 2.0, 0.06, 0.01, True, False, False),  # down-in put, K < B
+        (0.25, 80.0, 1.0, 100.0, 85.0, 1.5, _R, _Q, True, False, True),       # down-in call, K < B
+    ]
+    for args in cases:
+        assert barrier_price_analytic(*args, rebate_paid_at_expiry=False) == \
+            barrier_price_analytic(*args, rebate_paid_at_expiry=True), args
+
+
+def test_barrier_rebate_flag_default_unchanged():
+    # Default (False) path stays on the tff hit-timing convention; the flag
+    # genuinely moves the KO rebate term.
+    args = (0.25, 100.0, 1.0, 100.0, 85.0, 3.0, _R, _Q, True, True, True)
+    hit = barrier_price_analytic(*args)
+    assert abs(hit - 11.475189709298022) < 1e-10
+    expiry = barrier_price_analytic(*args, rebate_paid_at_expiry=True)
+    assert abs(expiry - 11.300833094739227) < 1e-10
+    assert abs(hit - expiry) > 0.1
 
 
 def test_binary_golden_values():

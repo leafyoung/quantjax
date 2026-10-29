@@ -172,13 +172,25 @@ def lookback_option(
     num_paths: int,
     strike_type: str,
     seed: int,
+    monitoring: str = "discrete",
 ) -> float:
     """Price a lookback option by Monte Carlo with daily steps (252 per year,
-    matching the Python hard-coded `dt = expiry / 252`)."""
+    matching the Python hard-coded `dt = expiry / 252`).
+
+    ``monitoring="continuous"`` applies the Broadie-Glasserman-Kou (1997)
+    continuity correction to the discrete-monitoring estimator: the running
+    maximum is inflated by ``e^{+beta*sigma*sqrt(dt)}`` and the running minimum
+    deflated by ``e^{-beta*sigma*sqrt(dt)}`` with
+    ``beta = -zeta(1/2)/sqrt(2*pi) ~= 0.5826``. Verified against QuantLib 1.44
+    ``AnalyticContinuousFixedLookbackEngine`` (fixed call S=100 K=100 r=5%
+    q=0 vol=20% T=1 -> 19.16762525733232; the uncorrected discrete estimator
+    sits ~4.6% low at 252 steps)."""
     _validate_parameters(volatility, expiry, num_paths)
     _validate_option_type(option_type)
     if strike_type not in ("fixed", "floating"):
         raise ValueError("Invalid strike type")
+    if monitoring not in ("discrete", "continuous"):
+        raise ValueError("Invalid monitoring type")
 
     dt = expiry / 252.0
     num_steps = int(expiry / dt)
@@ -186,6 +198,13 @@ def lookback_option(
     drift = (rate - 0.5 * volatility * volatility) * dt
     sig_sqrt_dt = volatility * math.sqrt(dt)
     disc = math.exp(-rate * expiry)
+    if monitoring == "continuous":
+        beta = 0.5825971579390108  # -zeta(1/2)/sqrt(2*pi), BGK (1997)
+        bgk_up = math.exp(beta * volatility * math.sqrt(dt))
+        bgk_dn = math.exp(-beta * volatility * math.sqrt(dt))
+    else:
+        bgk_up = 1.0
+        bgk_dn = 1.0
 
     total = 0.0
     for _ in range(num_paths):
@@ -201,14 +220,14 @@ def lookback_option(
                 min_p = price
         if option_type == "call":
             if strike_type == "fixed":
-                payoff = max(max_p - strike, 0.0)
+                payoff = max(max_p * bgk_up - strike, 0.0)
             else:
-                payoff = max(price - max_p, 0.0)
+                payoff = max(price - max_p * bgk_up, 0.0)
         else:
             if strike_type == "fixed":
-                payoff = max(strike - min_p, 0.0)
+                payoff = max(strike - min_p * bgk_dn, 0.0)
             else:
-                payoff = max(min_p - price, 0.0)
+                payoff = max(min_p * bgk_dn - price, 0.0)
         total += payoff * disc
     return total / num_paths
 
@@ -615,6 +634,58 @@ def test_lookback_fixed_put():
     # Reference: scripts/gen_exotics.py, seed 1239.
     v = lookback_option("put", 100.0, 100.0, 0.5, 0.2, 0.05, 200, "fixed", 1239)
     assert abs(v - 9.323267890110916) < 1e-9
+
+
+def test_lookback_continuous_fixed_call():
+    # Reference: ../quantburn/scripts/gen_exotics.py lookback_option_continuous,
+    # seed 1244 (first seed of the continuous variant).
+    v = lookback_option("call", 100.0, 100.0, 0.5, 0.2, 0.05, 200, "fixed", 1244,
+                        monitoring="continuous")
+    assert abs(v - 11.879877441725975) < 1e-9
+
+
+def test_lookback_continuous_rejects_bad_monitoring():
+    import pytest
+    with pytest.raises(ValueError):
+        lookback_option("call", 100.0, 100.0, 0.5, 0.2, 0.05, 10, "fixed", 1,
+                        monitoring="weekly")
+
+
+def test_lookback_continuous_fixed_call_ql_golden():
+    # 200k paths, 252 steps, seed 1244. QuantLib 1.44 golden:
+    # ContinuousFixedLookbackOption + AnalyticContinuousFixedLookbackEngine,
+    # S=100 K=100 r=5% q=0 vol=20% T=1 -> 19.16762525733232.
+    # BGK-corrected MC lands ~2.4e-3 relative below the golden at this seed
+    # (MC noise at 200k paths is of the same order); band 3e-2. The discrete
+    # estimator (uncorrected) sits ~4.6% low, i.e. the BGK bias.
+    v = lookback_option("call", 100.0, 100.0, 1.0, 0.2, 0.05, 200_000, "fixed", 1244,
+                        monitoring="continuous")
+    assert abs(v - 19.12157821818025) < 1e-9
+    golden = 19.16762525733232
+    assert abs(v - golden) / golden <= 3e-2
+
+
+def test_lookback_continuous_fixed_put_ql_golden():
+    # 200k paths, 252 steps, seed 1245. QL golden (same setup, put):
+    # 12.339744687432269. Verifies the minimum-deflation direction
+    # (min_cont ~ min_disc * e^{-beta*sigma*sqrt(dt)}).
+    v = lookback_option("put", 100.0, 100.0, 1.0, 0.2, 0.05, 200_000, "fixed", 1245,
+                        monitoring="continuous")
+    assert abs(v - 12.324399072817435) < 1e-9
+    golden = 12.339744687432269
+    assert abs(v - golden) / golden <= 3e-2
+
+
+def test_lookback_continuous_vs_discrete_bgk_gap():
+    # Same seed (1244), 20k paths: the BGK-adjusted price exceeds the discrete
+    # price by ~4.6% here. The extremum itself is inflated only by
+    # e^{beta*sigma*sqrt(dt)} ~ 1.00737; the price gap is leveraged through
+    # (f*E[M] - K) / (E[M] - K) with E[M] ~ 119, K = 100.
+    d = lookback_option("call", 100.0, 100.0, 1.0, 0.2, 0.05, 20_000, "fixed", 1244)
+    c = lookback_option("call", 100.0, 100.0, 1.0, 0.2, 0.05, 20_000, "fixed", 1244,
+                        monitoring="continuous")
+    ratio = c / d
+    assert 1.03 < ratio < 1.06
 
 
 def test_asian_mc_arithmetic():
