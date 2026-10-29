@@ -446,7 +446,7 @@ def asian_option_greeks(
                 fixings.append(s_j)
                 d_s_mean += s_j
                 # dS_j/dsigma = S_j*(sqrt(dt)*cumz_j - sigma*t_j)
-                dst_dsig.append(s_j * (cum_w / sig - sig * (j * dt)))
+                dst_dsig.append(s_j * (cum_w - sig * (j * dt)))
             s_mean = sum(fixings) / num_steps
             if s_mean > k:
                 acc_d += s_mean / s0_eff
@@ -566,7 +566,7 @@ def test_asian_matches_reference():
     g = asian_option_greeks(100.0, 100.0, 1.0, 0.05, 0.2, 20_000, 25, _SEED)
     assert _close(g.delta, 0.5887073328616931, _TOL), f"delta {g.delta}"
     assert _close(g.gamma, 0.028729412145708937, 0.05), f"gamma {g.gamma}"
-    assert _close(g.vega, 137.0740789055746, _TOL), f"vega {g.vega}"
+    assert _close(g.vega, 22.393095421957234, _TOL), f"vega {g.vega}"
     assert abs(g.delta - 0.591980) < 0.004, f"delta vs reference {g.delta}"
 
 
