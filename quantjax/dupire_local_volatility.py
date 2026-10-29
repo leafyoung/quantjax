@@ -8,10 +8,17 @@ supplied as a function. `simulate` performs `steps` Euler steps updating
 `(step + 1) * dt`. A negative value from the surface raises ValueError.
 Normals come from `quantjax.rng.Xorshift64Star` with an explicit `seed`
 (module RNG seed in the Python source: 2009).
+
+`simulate_tensor` vectorizes the Euler update across paths as jax.numpy
+float64 array ops; the surface is still evaluated host-side per step
+(exactly like the scalar loop, same evaluation order / RNG draw order), and
+the per-path sigmas are uploaded via jnp.array.
 """
 
 import math
 from typing import Callable, List
+
+import jax.numpy as jnp
 
 from quantjax.rng import Xorshift64Star
 
@@ -42,6 +49,43 @@ def simulate(
         for i in range(n):
             z = rng.next_std_normal()
             spot[i] *= math.exp(rate * dt + diffusion[i] * z)
+    return spot
+
+
+def simulate_tensor(
+    local_vol_func: Callable[[float, float], float],
+    s0: float,
+    t: float,
+    n: int,
+    steps: int,
+    rate: float,
+    seed: int,
+) -> "jnp.ndarray":
+    """Tensor variant of `simulate`: the per-step Euler update
+    `spot *= exp(rate*dt + sigma(spot, t)*sqrt(dt)*z)` runs as a jax.numpy
+    float64 array op across all paths. The local-volatility surface is still
+    evaluated host-side per step, path by path, on the current spot vector
+    (same evaluation order as the scalar loop; a negative sigma raises
+    ValueError before any normals are drawn for that step). Normals are drawn
+    host-side from Xorshift64Star — one block of `n` per step, path order
+    matching the scalar loop — and uploaded via jnp.array. Returns a float64
+    `(n,)` array."""
+    steps = max(steps, 1)
+    dt = t / steps
+    sqrt_dt = math.sqrt(dt)
+    spot = jnp.full((n,), s0, dtype=jnp.float64)
+    rng = Xorshift64Star(seed)
+    for step in range(steps):
+        time = (step + 1) * dt
+        sigmas = []
+        for s in spot:
+            sigma = local_vol_func(float(s), time)
+            if sigma < 0.0:
+                raise ValueError("Negative volatility encountered")
+            sigmas.append(sigma)
+        diffusion = jnp.asarray(sigmas, dtype=jnp.float64) * sqrt_dt
+        z = jnp.asarray([rng.next_std_normal() for _ in range(n)], dtype=jnp.float64)
+        spot = spot * jnp.exp(rate * dt + diffusion * z)
     return spot
 
 
@@ -93,3 +137,47 @@ def test_negative_volatility_raises():
 
     with pytest.raises(ValueError, match="Negative volatility encountered"):
         simulate(lambda _s, _t: -0.1, 100.0, 1.0, 2, 4, 0.0, 2009)
+
+
+# ---------------------------------------------------------------------------
+# Tensor-variant parity tests (same RNG draws and surface-evaluation order as
+# the scalar reference; 1e-9 relative tolerance for jnp float64 rounding)
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_tensor_matches_scalar_constant_surface():
+    out_scalar = simulate(lambda _s, _t: 0.2, 100.0, 1.0, 6, 32, 0.05, 2009)
+    out_tensor = simulate_tensor(lambda _s, _t: 0.2, 100.0, 1.0, 6, 32, 0.05, 2009)
+    assert out_tensor.shape == (6,)
+    assert out_tensor.dtype == jnp.float64
+    expected = [
+        92.02458413250487,
+        87.40917483785537,
+        95.42764799048972,
+        93.92498775669627,
+        125.67360115565047,
+        117.31017140023587,
+    ]
+    for got, want in zip(out_tensor, expected):
+        assert _rel(float(got), want) < 1e-9, f"got={float(got)} want={want}"
+    for got, want in zip(out_tensor, out_scalar):
+        assert _rel(float(got), want) < 1e-9, f"got={float(got)} want={want}"
+
+
+def test_simulate_tensor_matches_scalar_state_dependent_surface():
+    def surface(s: float, t: float) -> float:
+        return 0.1 + 0.2 * min(s / 100.0, 2.0) * (1.0 / (1.0 + t))
+
+    out_scalar = simulate(surface, 100.0, 0.5, 4, 16, 0.02, 2009)
+    out_tensor = simulate_tensor(surface, 100.0, 0.5, 4, 16, 0.02, 2009)
+    assert out_tensor.shape == (4,)
+    assert out_tensor.dtype == jnp.float64
+    for got, want in zip(out_tensor, out_scalar):
+        assert _rel(float(got), want) < 1e-9, f"got={float(got)} want={want}"
+
+
+def test_simulate_tensor_negative_volatility_raises():
+    import pytest
+
+    with pytest.raises(ValueError, match="Negative volatility encountered"):
+        simulate_tensor(lambda _s, _t: -0.1, 100.0, 1.0, 2, 4, 0.0, 2009)

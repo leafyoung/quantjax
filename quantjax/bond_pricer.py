@@ -6,10 +6,20 @@ callable/putable bonds on a short-rate lattice, convertible bonds on a
 stock binomial tree (with call/put exercise schedules), and a
 stochastic-rate coupon bond. All math is scalar Python floats (pure
 lattice / closed-form, no tensors needed).
+
+Tensor variants: the short-rate-tree backward induction
+(`callable_bond_lattice_tensor` / `putable_bond_lattice_tensor`) maps
+cleanly to jax.numpy float64 array ops (the node vector shrinks by one each
+step), so it is ported in `*_tensor` form with identical arithmetic,
+clamps and exercise schedule handling. The closed-form pieces
+(`coupon_bond`, zero-coupon) remain scalar float64 per the package
+conventions; the rate tree is built host-side and uploaded via jnp.array.
 """
 
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import jax.numpy as jnp
 
 EPSILON = 1e-8
 
@@ -129,6 +139,97 @@ def putable_bond(
     put_period: int,
 ) -> float:
     return putable_bond_lattice(face_value, coupon_rate, rate, periods, put_price, put_period, None)
+
+
+def _short_rate_tree_tensor(initial_rate: float, count: int, rate_volatility: float) -> List["jnp.ndarray"]:
+    """jnp variant of `_short_rate_tree`: one float64 row per period, row `n`
+    holding the `n + 1` short rates. Built host-side (deterministic grid) and
+    uploaded via jnp.asarray."""
+    sigma = max(rate_volatility, 0.0)
+    if sigma == 0.0:
+        return [jnp.full((n + 1,), initial_rate, dtype=jnp.float64) for n in range(count)]
+    up = math.exp(sigma)
+    tree = []
+    for n in range(count):
+        exponents = range(-n, n + 1, 2)
+        tree.append(
+            jnp.asarray([max(initial_rate * up ** e, 0.0) for e in exponents], dtype=jnp.float64)
+        )
+    return tree
+
+
+def _embedded_option_bond_lattice_tensor(
+    face_value: float,
+    coupon_rate: float,
+    rate: float,
+    periods: int,
+    exercise_price: Optional[float],
+    exercise_period: Optional[int],
+    exercise_kind: Optional[str],
+    rate_volatility: Optional[float],
+) -> "jnp.ndarray":
+    """jnp variant of `_embedded_option_bond_lattice`: the backward induction
+    over the short-rate tree runs as jax.numpy float64 array ops on the node
+    value vector (same clamps: denominator floor `max(1+r, EPSILON)`; call
+    caps / put floors at the exercise date). Returns a 0-d jnp float64
+    array."""
+    n = _period_count(periods)
+    rate_tree = _short_rate_tree_tensor(rate, n, rate_volatility if rate_volatility is not None else 0.0)
+    coupon = face_value * coupon_rate
+    continuation = jnp.full((n + 1,), face_value, dtype=jnp.float64)
+
+    exercise_index = None
+    if exercise_period is not None:
+        exercise_index = min(max(int(exercise_period), 1), n)
+
+    for step in range(n - 1, -1, -1):
+        expected_next = 0.5 * (continuation[:-1] + continuation[1:])
+        node_values = (coupon + expected_next) / jnp.maximum(1.0 + rate_tree[step], EPSILON)
+        if exercise_index is not None and exercise_price is not None and step + 1 == exercise_index:
+            if exercise_kind == "call":
+                node_values = jnp.minimum(node_values, exercise_price)
+            elif exercise_kind == "put":
+                node_values = jnp.maximum(node_values, exercise_price)
+        continuation = node_values
+    return continuation[0]
+
+
+def callable_bond_lattice_tensor(
+    face_value: float,
+    coupon_rate: float,
+    rate: float,
+    periods: int,
+    call_price: float,
+    call_period: int,
+    rate_volatility: Optional[float] = None,
+) -> "jnp.ndarray":
+    """Tensor variant of `callable_bond_lattice` (jnp backward induction; the
+    straight coupon bond stays closed-form scalar float64). Returns a 0-d
+    jnp float64 array."""
+    lattice_value = _embedded_option_bond_lattice_tensor(
+        face_value, coupon_rate, rate, periods,
+        call_price, call_period, "call", rate_volatility,
+    )
+    return jnp.minimum(lattice_value, coupon_bond(face_value, coupon_rate, rate, periods))
+
+
+def putable_bond_lattice_tensor(
+    face_value: float,
+    coupon_rate: float,
+    rate: float,
+    periods: int,
+    put_price: float,
+    put_period: int,
+    rate_volatility: Optional[float] = None,
+) -> "jnp.ndarray":
+    """Tensor variant of `putable_bond_lattice` (jnp backward induction; the
+    straight coupon bond stays closed-form scalar float64). Returns a 0-d
+    jnp float64 array."""
+    lattice_value = _embedded_option_bond_lattice_tensor(
+        face_value, coupon_rate, rate, periods,
+        put_price, put_period, "put", rate_volatility,
+    )
+    return jnp.maximum(lattice_value, coupon_bond(face_value, coupon_rate, rate, periods))
 
 
 def convertible_bond(
@@ -397,3 +498,39 @@ def test_stochastic_rate_bond():
         stochastic_rate_bond(1000.0, 0.04, [0.03, 0.035, 0.04, 0.045]),
         1010.083333337649,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tensor-variant parity tests: jnp backward induction over the short-rate
+# tree vs the scalar lattice on identical inputs (1e-9 relative tolerance).
+# ---------------------------------------------------------------------------
+
+
+def test_callable_bond_lattice_tensor_matches_scalar():
+    scalar = callable_bond_lattice(1000.0, 0.06, 0.05, 5, 1050.0, 3, 0.1)
+    tensor = callable_bond_lattice_tensor(1000.0, 0.06, 0.05, 5, 1050.0, 3, 0.1)
+    assert tensor.dtype == jnp.float64
+    assert tensor.shape == ()
+    _assert_close(float(tensor), scalar)
+
+    # Zero-volatility tree (degenerate constant rows).
+    scalar0 = callable_bond_lattice(1000.0, 0.06, 0.05, 5, 1050.0, 3, 0.0)
+    tensor0 = callable_bond_lattice_tensor(1000.0, 0.06, 0.05, 5, 1050.0, 3, 0.0)
+    _assert_close(float(tensor0), scalar0)
+    # Clamped exercise period (period beyond maturity).
+    scalar_clamp = callable_bond_lattice(1000.0, 0.06, 0.05, 5, 1050.0, 99, 0.1)
+    tensor_clamp = callable_bond_lattice_tensor(1000.0, 0.06, 0.05, 5, 1050.0, 99, 0.1)
+    _assert_close(float(tensor_clamp), scalar_clamp)
+
+
+def test_putable_bond_lattice_tensor_matches_scalar():
+    scalar = putable_bond_lattice(1000.0, 0.06, 0.05, 5, 950.0, 3, 0.1)
+    tensor = putable_bond_lattice_tensor(1000.0, 0.06, 0.05, 5, 950.0, 3, 0.1)
+    assert tensor.dtype == jnp.float64
+    assert tensor.shape == ()
+    _assert_close(float(tensor), scalar)
+
+    # Exercise at the first allowed period, exercising every step.
+    scalar1 = putable_bond_lattice(1000.0, 0.06, 0.05, 5, 1005.0, 1, 0.15)
+    tensor1 = putable_bond_lattice_tensor(1000.0, 0.06, 0.05, 5, 1005.0, 1, 0.15)
+    _assert_close(float(tensor1), scalar1)

@@ -13,10 +13,17 @@ draws use the Cholesky factor as `z @ L.T`.
 
 All math is closed-form/scalar float64 in plain Python; panics in the Rust
 port (invalid parameters) become ValueError here.
+
+Tensor variants (`*_tensor`) run the numerically-heavy Monte-Carlo path
+construction / payoff aggregation as jax.numpy float64 array ops. Normals are
+still drawn host-side from `quantjax.rng.Xorshift64Star` (bit-identical draw
+order to the scalar functions) and uploaded via `jnp.array`.
 """
 
 import math
 from typing import List, Optional, Sequence
+
+import jax.numpy as jnp
 
 from quantjax.black_scholes_merton import black_scholes_merton, normal_cdf
 from quantjax.lmm import cholesky
@@ -256,6 +263,157 @@ def asian_option(
             payoff = max(strike - avg_price, 0.0)
         total += payoff * disc
     return total / num_paths
+
+
+def gbm_paths_tensor(
+    spot: float,
+    rate: float,
+    volatility: float,
+    expiry: float,
+    num_paths: int,
+    num_steps: int,
+    seed: int,
+) -> "jnp.ndarray":
+    """Exact-lognormal GBM path construction as jnp float64 ops.
+
+    Returns a `(num_paths, num_steps + 1)` array with `paths[:, 0] = spot`.
+    The per-step update `price *= exp((r - v^2/2) dt + v sqrt(dt) z)` matches
+    the scalar Monte-Carlo loops in this module (`barrier_option`,
+    `asian_option`, `lookback_option`). Normals are drawn host-side from
+    `quantjax.rng.Xorshift64Star` in path-major order (one full path per
+    scalar outer loop iteration) and reshaped to `(num_paths, num_steps)`;
+    a Python loop over steps then runs the vectorized update (heston-style).
+    """
+    _validate_parameters(volatility, expiry, num_paths)
+    dt = expiry / num_steps if num_steps > 0 else 0.0
+    rng = Xorshift64Star(seed)
+    z_flat = [rng.next_std_normal() for _ in range(num_paths * num_steps)]
+    z = jnp.asarray(z_flat, dtype=jnp.float64).reshape(num_paths, num_steps)
+
+    drift_step = (rate - 0.5 * volatility * volatility) * dt
+    sig_sqrt_dt = volatility * math.sqrt(dt)
+
+    price = jnp.full((num_paths,), spot, dtype=jnp.float64)
+    cols = [price]
+    for step in range(num_steps):
+        z_step = z[:, step]
+        price = price * jnp.exp(drift_step + sig_sqrt_dt * z_step)
+        cols.append(price)
+    return jnp.stack(cols, axis=1)
+
+
+def digital_option_tensor(
+    option_type: str,
+    spot: float,
+    strike: float,
+    expiry: float,
+    volatility: float,
+    rate: float,
+    payout: float,
+    num_paths: int,
+    seed: int,
+) -> "jnp.ndarray":
+    """Tensor variant of `digital_option`: the exact-lognormal terminal price
+    and the cash-or-nothing indicator run as jnp float64 array ops. Normals
+    are drawn host-side (same draw order as the scalar function) and uploaded
+    via `jnp.array`. Returns a 0-d jnp float64 array."""
+    _validate_parameters(volatility, expiry, num_paths)
+    _validate_option_type(option_type)
+
+    rng = Xorshift64Star(seed)
+    z = jnp.asarray(rng.normals(num_paths), dtype=jnp.float64)
+    asset_price = spot * jnp.exp(
+        (rate - 0.5 * volatility * volatility) * expiry
+        + volatility * math.sqrt(expiry) * z
+    )
+    if option_type == "call":
+        paid = asset_price >= strike
+    else:
+        paid = asset_price <= strike
+    payoff = jnp.where(paid, payout, 0.0)
+    return jnp.mean(payoff) * math.exp(-rate * expiry)
+
+
+def barrier_option_tensor(
+    option_type: str,
+    barrier_type: str,
+    spot: float,
+    strike: float,
+    barrier: float,
+    expiry: float,
+    volatility: float,
+    rate: float,
+    num_paths: int,
+    num_steps: int,
+    seed: int,
+) -> "jnp.ndarray":
+    """Tensor variant of `barrier_option`: the GBM path construction comes
+    from `gbm_paths_tensor` (identical RNG draws, same per-step update), and
+    the barrier hit detection / vanilla payoff aggregation run as jnp float64
+    array ops over the whole path matrix. Hit detection covers every stepped
+    price (columns 1..num_steps), never the initial spot, exactly like the
+    scalar loop. Returns a 0-d jnp float64 array."""
+    _validate_parameters(volatility, expiry, num_paths)
+    _validate_option_type(option_type)
+    if barrier_type not in ("up-and-out", "down-and-out", "up-and-in", "down-and-in"):
+        raise ValueError("Invalid barrier type")
+
+    paths = gbm_paths_tensor(spot, rate, volatility, expiry, num_paths, num_steps, seed)
+    stepped = paths[:, 1:]
+    if barrier_type == "up-and-out":
+        crossed = stepped > barrier
+    elif barrier_type == "down-and-out":
+        crossed = stepped < barrier
+    elif barrier_type == "up-and-in":
+        crossed = stepped >= barrier
+    else:  # down-and-in
+        crossed = stepped <= barrier
+    hit = jnp.any(crossed, axis=1)
+
+    final = paths[:, -1]
+    if option_type == "call":
+        vanilla = jnp.maximum(final - strike, 0.0)
+    else:
+        vanilla = jnp.maximum(strike - final, 0.0)
+    if barrier_type.endswith("out"):
+        payoff = jnp.where(hit, 0.0, vanilla)
+    else:
+        payoff = jnp.where(hit, vanilla, 0.0)
+    return jnp.mean(payoff) * math.exp(-rate * expiry)
+
+
+def asian_option_tensor(
+    option_type: str,
+    spot: float,
+    strike: float,
+    expiry: float,
+    volatility: float,
+    rate: float,
+    num_paths: int,
+    num_steps: int,
+    average_type: str,
+    seed: int,
+) -> "jnp.ndarray":
+    """Tensor variant of `asian_option`: path construction via
+    `gbm_paths_tensor` (which already includes the initial spot as column 0,
+    matching the scalar average divisor `num_steps + 1`); the arithmetic /
+    geometric averaging and payoff aggregation run as jnp float64 array ops.
+    Returns a 0-d jnp float64 array."""
+    _validate_parameters(volatility, expiry, num_paths)
+    _validate_option_type(option_type)
+    if average_type not in ("arithmetic", "geometric"):
+        raise ValueError("Invalid average type")
+
+    paths = gbm_paths_tensor(spot, rate, volatility, expiry, num_paths, num_steps, seed)
+    if average_type == "arithmetic":
+        avg_price = jnp.mean(paths, axis=1)
+    else:
+        avg_price = jnp.exp(jnp.mean(jnp.log(paths), axis=1))
+    if option_type == "call":
+        payoff = jnp.maximum(avg_price - strike, 0.0)
+    else:
+        payoff = jnp.maximum(strike - avg_price, 0.0)
+    return jnp.mean(payoff) * math.exp(-rate * expiry)
 
 
 def quanto_option(
@@ -503,3 +661,74 @@ def test_chooser_call_dominates():
 def test_chooser_put_dominates():
     v = chooser_option(80.0, 100.0, 1.0, 0.2, 0.05, 0.5)
     assert abs(v - 17.54304177655884) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Tensor-variant parity tests: same RNG draws (Xorshift64Star, same seed) and
+# same arithmetic as the scalar f64 references above; jnp float64 summation
+# order may differ, hence the 1e-9 relative tolerance.
+# ---------------------------------------------------------------------------
+
+
+def _rel_tensor(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(b), 1e-300)
+
+
+def test_gbm_paths_tensor_shape_and_dtype():
+    paths = gbm_paths_tensor(100.0, 0.05, 0.2, 1.0, 16, 8, 1236)
+    assert paths.shape == (16, 9)
+    assert paths.dtype == jnp.float64
+    # Initial column is exactly the spot.
+    assert all(float(v) == 100.0 for v in paths[:, 0])
+
+
+def test_digital_option_tensor_matches_scalar():
+    scalar_call = digital_option("call", 100.0, 100.0, 1.0, 0.2, 0.05, 10.0, 1000, 1234)
+    tensor_call = digital_option_tensor("call", 100.0, 100.0, 1.0, 0.2, 0.05, 10.0, 1000, 1234)
+    assert tensor_call.dtype == jnp.float64
+    assert _rel_tensor(float(tensor_call), scalar_call) < 1e-9, (float(tensor_call), scalar_call)
+
+    scalar_put = digital_option("put", 100.0, 95.0, 1.0, 0.2, 0.05, 10.0, 1000, 1234)
+    tensor_put = digital_option_tensor("put", 100.0, 95.0, 1.0, 0.2, 0.05, 10.0, 1000, 1234)
+    assert _rel_tensor(float(tensor_put), scalar_put) < 1e-9, (float(tensor_put), scalar_put)
+
+
+def test_barrier_option_tensor_matches_scalar():
+    for option_type, barrier_type, barrier, seed in (
+        ("call", "up-and-out", 120.0, 1236),
+        ("put", "down-and-in", 85.0, 1237),
+        ("call", "up-and-in", 130.0, 1236),
+        ("put", "down-and-out", 80.0, 1237),
+    ):
+        scalar = barrier_option(
+            option_type, barrier_type, 100.0, 100.0, barrier, 1.0, 0.2, 0.05, 500, 50, seed
+        )
+        tensor = barrier_option_tensor(
+            option_type, barrier_type, 100.0, 100.0, barrier, 1.0, 0.2, 0.05, 500, 50, seed
+        )
+        assert tensor.dtype == jnp.float64
+        assert _rel_tensor(float(tensor), scalar) < 1e-9, (barrier_type, float(tensor), scalar)
+
+
+def test_asian_option_tensor_matches_scalar():
+    scalar_arith = asian_option("call", 100.0, 100.0, 1.0, 0.2, 0.05, 1000, 50, "arithmetic", 1240)
+    tensor_arith = asian_option_tensor("call", 100.0, 100.0, 1.0, 0.2, 0.05, 1000, 50, "arithmetic", 1240)
+    assert tensor_arith.dtype == jnp.float64
+    assert _rel_tensor(float(tensor_arith), scalar_arith) < 1e-9, (float(tensor_arith), scalar_arith)
+
+    scalar_geom = asian_option("put", 100.0, 100.0, 1.0, 0.2, 0.05, 1000, 50, "geometric", 1241)
+    tensor_geom = asian_option_tensor("put", 100.0, 100.0, 1.0, 0.2, 0.05, 1000, 50, "geometric", 1241)
+    assert _rel_tensor(float(tensor_geom), scalar_geom) < 1e-9, (float(tensor_geom), scalar_geom)
+
+
+def test_barrier_tensor_paths_drive_payoff():
+    """Sanity: with barrier far away the tensor barrier price degenerates to
+    the vanilla terminal payoff (MC), i.e. hits are actually detected."""
+    far = float(barrier_option_tensor(
+        "call", "up-and-out", 100.0, 100.0, 1e9, 1.0, 0.2, 0.05, 500, 50, 1236
+    ))
+    near = float(barrier_option_tensor(
+        "call", "up-and-out", 100.0, 100.0, 101.0, 1.0, 0.2, 0.05, 500, 50, 1236
+    ))
+    assert far > 0.0
+    assert near < far
